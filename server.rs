@@ -83,13 +83,14 @@ impl crate::Plugin for Plugin {
                 let new_current = current
                     .checked_add_signed(TimeDelta::try_hours(1).unwrap())
                     .unwrap();
-                result.push(CompressedEvent {
-                    title: "Text".to_string(),
-                    time: Timing::Range(TimeRange {
+                let timing = Timing::Range(TimeRange {
                         start: current,
                         end: new_current,
-                    }),
-                    data: Box::new(CompressedTextPluginEvent::UploadText),
+                });
+                result.push(CompressedEvent {
+                    title: "Write Text".to_string(),
+                    time: timing.clone(),
+                    data: Box::new(CompressedTextPluginEvent::UploadText(timing)),
                 });
                 current = new_current;
             }
@@ -143,7 +144,7 @@ async fn create_text(
 
 #[post("/delete", data = "<request>")]
 async fn delete_text(
-    request: String,
+    request: Json<String>,
     cookies: &CookieJar<'_>,
     config: &State<Config>,
     database: &State<Arc<Database>>,
@@ -160,7 +161,7 @@ async fn delete_text(
         .delete_one(
             Database::combine_documents(
                 Database::generate_find_plugin_filter(Plugin::get_type()),
-                doc! {"id": request},
+                doc! {"id": (*request).clone()},
             ),
             None,
         )
@@ -182,7 +183,7 @@ async fn delete_text(
 #[derive(Serialize, Deserialize, Clone, Debug)]
 enum CompressedTextPluginEvent {
     Text(CompressedTextEvent),
-    UploadText,
+    UploadText(Timing),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
