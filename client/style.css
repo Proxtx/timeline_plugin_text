@@ -1,0 +1,43 @@
+.text-row {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  align-items: end;
+  box-sizing: border-box;
+}
+
+.text-body {
+  box-sizing: border-box;
+  color: var(--darkColor, #292f36);
+  padding: 6px;
+  background-color: var(--lightColor, #fcfafa);
+  width: 100%;
+  font-family: serif;
+  font-size: 120%;
+}
+
+.text-textarea {
+  box-sizing: border-box;
+  border: none;
+  color: var(--darkColor, #292f36);
+  padding: 6px;
+  background-color: var(--lightColor, #fcfafa);
+  width: 100%;
+  height: 100px;
+  font-family: serif;
+  font-size: 120%;
+  resize: vertical;
+}
+.text-textarea:focus {
+  outline: none;
+}
+
+.text-btn {
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 36px;
+  background-color: var(--accentColor1, #2589bd);
+  cursor: pointer;
+}

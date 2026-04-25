@@ -1,0 +1,7 @@
+[plugin]
+name = "timeline_plugin_text"
+port = 9006
+token = "change-me"
+
+[config]
+# (nothing plugin-specific; the SDK provides all required state)

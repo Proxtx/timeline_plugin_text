@@ -1,93 +1,105 @@
-use {
-    rocket::{
-        http::{CookieJar, Status},
-        post, routes,
-        serde::json::Json,
-        State,
-    }, serde::{Deserialize, Serialize}, server_api::{
-        config::Config, db::{Database, Event}, external::{futures::{self, StreamExt}, types::{api::{APIError, APIResult, CompressedEvent}, available_plugins::AvailablePlugins, external::{chrono::{TimeDelta, Utc}, mongodb::bson::doc, serde_json}, timing::{TimeRange, Timing}}}, plugin::{PluginData, PluginTrait}, web::auth
-    }, std::sync::Arc
+//! Text plugin: lets the user pin a free-form text snippet to any hour
+//! of any day. Stores them in SQLite. Each hour the user hasn't filled
+//! in is exposed as an `UploadText` placeholder so the frontend can
+//! render an inline editor.
+
+use chrono::{TimeDelta, Utc};
+use rocket::http::Status;
+use rocket::serde::json::Json;
+use rocket::{post, routes, Route, State};
+use serde::{Deserialize, Serialize};
+
+use timeline_plugin_sdk::auth::AuthedClient;
+use timeline_plugin_sdk::launch::PluginState;
+use timeline_plugin_sdk::{
+    APIError, APIResult, CompressedEvent, Context, Manifest, Plugin, Style, StoredEvent,
+    TimeRange, Timing,
 };
 
-pub struct Plugin {
-    plugin_data: PluginData,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum CompressedTextPluginEvent {
+    Text { text: String, id: String },
+    UploadText { timing: Timing },
 }
 
-impl PluginTrait for Plugin {
-    async fn new(data: crate::PluginData) -> Self
-    where
-        Self: Sized,
-    {
-        Plugin { plugin_data: data }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredText {
+    text: String,
+}
+
+pub struct TextPlugin {
+    ctx: Context,
+}
+
+impl Plugin for TextPlugin {
+    async fn new(ctx: Context) -> anyhow::Result<Self> {
+        Ok(TextPlugin { ctx })
     }
 
-    fn get_type() -> AvailablePlugins
-    where
-        Self: Sized,
-    {
-        AvailablePlugins::timeline_plugin_text
+    fn manifest(&self) -> Manifest {
+        Manifest {
+            name: self.ctx.config.name.clone(),
+            display_name: self
+                .ctx
+                .config
+                .display_name
+                .clone()
+                .unwrap_or_else(|| "Text".into()),
+            style: Style::Acc1,
+            icon: None,
+            web_entry: Some("timeline_plugin_text_client.js".into()),
+        }
     }
 
-    fn get_routes() -> Vec<rocket::Route>
-    where
-        Self: Sized,
-    {
+    async fn events(&self, range: TimeRange) -> APIResult<Vec<CompressedEvent>> {
+        let stored = self
+            .ctx
+            .db
+            .query_range_typed::<StoredText>(&range)
+            .await
+            .map_err(|e| APIError::DatabaseError(e.to_string()))?;
+        let mut out = Vec::with_capacity(stored.len());
+        for ev in stored {
+            let payload = CompressedTextPluginEvent::Text {
+                text: ev.data.text.clone(),
+                id: ev.id.clone(),
+            };
+            out.push(CompressedEvent {
+                title: "Text".to_string(),
+                time: ev.time,
+                data: serde_json::to_value(payload)?,
+            });
+        }
+
+        // Synthesize one UploadText placeholder per hour in the range.
+        let mut current = range.start;
+        let hour = TimeDelta::try_hours(1).unwrap_or_default();
+        while current < range.end {
+            let next = current.checked_add_signed(hour).unwrap_or(range.end);
+            let timing = Timing::Range(TimeRange {
+                start: current,
+                end: next,
+            });
+            let payload = CompressedTextPluginEvent::UploadText {
+                timing: timing.clone(),
+            };
+            out.push(CompressedEvent {
+                title: "Write Text".to_string(),
+                time: timing,
+                data: serde_json::to_value(payload)?,
+            });
+            current = next;
+        }
+        Ok(out)
+    }
+
+    fn routes(&self) -> Vec<Route> {
         routes![create_text, delete_text]
     }
-
-    fn get_compressed_events(
-        &self,
-        query_range: &TimeRange,
-    ) -> std::pin::Pin<
-        Box<
-            dyn futures::Future<Output = APIResult<Vec<CompressedEvent>>>
-                + Send,
-        >,
-    > {
-        let filter = Database::generate_range_filter(query_range);
-        let plg_filter = Database::generate_find_plugin_filter(Plugin::get_type());
-        let filter = Database::combine_documents(filter, plg_filter);
-        let database = self.plugin_data.database.clone();
-        let query_range = query_range.clone();
-        Box::pin(async move {
-            let mut cursor = database.get_events::<String>().find(filter, None).await?;
-            let mut result = Vec::new();
-            while let Some(v) = cursor.next().await {
-                let t = v?;
-                result.push(CompressedEvent {
-                    title: "Text".to_string(),
-                    time: t.timing,
-                    data: serde_json::to_value(CompressedTextPluginEvent::Text(CompressedTextEvent {
-                        text: t.event,
-                        id: t.id,
-                    })).unwrap(),
-                })
-            }
-
-            let mut current = query_range.start;
-
-            while current < query_range.end {
-                let new_current = current
-                    .checked_add_signed(TimeDelta::try_hours(1).unwrap())
-                    .unwrap();
-                let timing = Timing::Range(TimeRange {
-                        start: current,
-                        end: new_current,
-                });
-                result.push(CompressedEvent {
-                    title: "Write Text".to_string(),
-                    time: timing.clone(),
-                    data: serde_json::to_value(CompressedTextPluginEvent::UploadText(timing)).unwrap(),
-                });
-                current = new_current;
-            }
-
-            Ok(result)
-        })
-    }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Debug, Clone, Deserialize)]
 struct CreateTextRequest {
     text: String,
     timing: Timing,
@@ -95,86 +107,54 @@ struct CreateTextRequest {
 
 #[post("/create", data = "<request>")]
 async fn create_text(
+    _auth: AuthedClient,
     request: Json<CreateTextRequest>,
-    cookies: &CookieJar<'_>,
-    config: &State<Config>,
-    database: &State<Arc<Database>>,
+    state: &State<PluginState>,
 ) -> (Status, Json<APIResult<()>>) {
-    if auth(cookies, config).is_err() {
-        return (
-            Status::Unauthorized,
-            Json(Err(APIError::AuthenticationError)),
-        );
-    }
-
-    match database
-        .register_single_event(&Event {
-            timing: request.timing.clone(),
-            id: Utc::now().timestamp_millis().to_string(),
-            plugin: Plugin::get_type(),
-            event: request.text.clone(),
-        })
-        .await
-    {
-        Ok(_) => (Status::Ok, Json(Ok(()))),
+    let req = request.into_inner();
+    let id = Utc::now().timestamp_millis().to_string();
+    let stored = match serde_json::to_value(StoredText { text: req.text.clone() }) {
+        Ok(v) => v,
         Err(e) => {
-            server_api::error::error(
-                database.inner().clone(),
-                &e,
-                Some(<Plugin as PluginTrait>::get_type()),
-                &config.error_report_url,
-            );
-            (Status::InternalServerError, Json(Err(e.into())))
+            return (
+                Status::InternalServerError,
+                Json(Err(APIError::SerdeJsonError(e.to_string()))),
+            )
+        }
+    };
+    let event = StoredEvent {
+        id,
+        title: "Text".to_string(),
+        time: req.timing,
+        data: stored,
+    };
+    match state.db.upsert(&event).await {
+        Ok(()) => (Status::Ok, Json(Ok(()))),
+        Err(e) => {
+            state.errors.report(format!("create text: {}", e));
+            (
+                Status::InternalServerError,
+                Json(Err(APIError::DatabaseError(e.to_string()))),
+            )
         }
     }
 }
 
 #[post("/delete", data = "<request>")]
 async fn delete_text(
+    _auth: AuthedClient,
     request: Json<String>,
-    cookies: &CookieJar<'_>,
-    config: &State<Config>,
-    database: &State<Arc<Database>>,
+    state: &State<PluginState>,
 ) -> (Status, Json<APIResult<()>>) {
-    if auth(cookies, config).is_err() {
-        return (
-            Status::Unauthorized,
-            Json(Err(APIError::AuthenticationError)),
-        );
-    }
-
-    match database
-        .events_collection::<String>()
-        .delete_one(
-            Database::combine_documents(
-                Database::generate_find_plugin_filter(Plugin::get_type()),
-                doc! {"id": (*request).clone()},
-            ),
-            None,
-        )
-        .await
-    {
-        Ok(_) => (Status::Ok, Json(Ok(()))),
+    let id = request.into_inner();
+    match state.db.delete(&id).await {
+        Ok(()) => (Status::Ok, Json(Ok(()))),
         Err(e) => {
-            server_api::error::error(
-                database.inner().clone(),
-                &e,
-                Some(<Plugin as PluginTrait>::get_type()),
-                &config.error_report_url,
-            );
-            (Status::InternalServerError, Json(Err(e.into())))
+            state.errors.report(format!("delete text: {}", e));
+            (
+                Status::InternalServerError,
+                Json(Err(APIError::DatabaseError(e.to_string()))),
+            )
         }
     }
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-enum CompressedTextPluginEvent {
-    Text(CompressedTextEvent),
-    UploadText(Timing),
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct CompressedTextEvent {
-    text: String,
-    id: String,
 }
